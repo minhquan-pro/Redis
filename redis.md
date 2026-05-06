@@ -442,3 +442,439 @@ const session = await redis.get(`session:user123`);
 | Dữ liệu >100GB               | Database  |
 
 **💡 Tip:** Kết hợp cả hai! Database + Redis cache = Perfect 🚀
+
+---
+
+## 8. 🎯 Cache Strategies - 6 Chiến Lược Quản Lý Cache
+
+Trong kỹ thuật hệ thống, để quản lý cache hiệu quả, có 6 chiến lược phổ biến. Mỗi chiến lược ưu tiên khác nhau giữa **tốc độ đọc**, **tốc độ ghi**, và **tính nhất quán dữ liệu**.
+
+---
+
+### 1️⃣ **Cache-Aside (Lazy Loading)** ⭐ Phổ biến nhất
+
+**Mô tả:** Ứng dụng chủ động kiểm tra cache. Nếu không có, lấy từ DB rồi lưu vào cache.
+
+**Luồng dữ liệu:**
+
+```
+Application
+  ↓
+Kiểm tra cache
+  ↓ (Cache Hit)     ↓ (Cache Miss)
+ Trả ngay          Query DB
+                     ↓
+                  Lưu vào cache
+                     ↓
+                  Trả về user
+```
+
+**Code Example:**
+
+```javascript
+async function getUser(userId) {
+  // Bước 1: Kiểm tra cache trước
+  let user = await redis.get(`user:${userId}`);
+  if (user) {
+    console.log("✅ Cache Hit");
+    return JSON.parse(user);
+  }
+
+  // Bước 2: Cache miss - query database
+  console.log("❌ Cache Miss - Query DB");
+  user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+
+  // Bước 3: Lưu vào cache để lần sau nhanh hơn
+  await redis.setex(`user:${userId}`, 3600, JSON.stringify(user));
+
+  return user;
+}
+```
+
+**Ưu điểm:**
+
+- ✅ Cache chỉ chứa dữ liệu thực sự cần thiết
+- ✅ Không phí cache vào dữ liệu không cần
+- ✅ Dễ implement
+
+**Nhược điểm:**
+
+- ❌ Lần đầu truy cập sẽ chậm (miss)
+- ❌ Có thời gian data stale (dữ liệu cũ)
+
+**Khi nào dùng:** Ứng dụng web thông thường, blog, e-commerce
+
+---
+
+### 2️⃣ **Read-Through Cache**
+
+**Mô tả:** Giống Cache-Aside nhưng ứng dụng không tự lấy DB. Thay vào đó, cache library tự động xử lý.
+
+**Luồng dữ liệu:**
+
+```
+Application
+  ↓
+Yêu cầu Cache Library
+  ↓
+Cache Library kiểm tra
+  ↓ (Hit)          ↓ (Miss)
+Trả ngay      Tự query DB + Lưu cache
+  ↑              ↓
+└──────────────────┘ Trả về
+```
+
+**Code Example:**
+
+```javascript
+// Sử dụng library như node-cache hoặc Redis wrapper
+const cacheManager = require("cache-manager");
+const redisStore = require("cache-manager-redis-store");
+
+const cache = cacheManager.caching({
+  store: redisStore,
+  host: "localhost",
+  port: 6379,
+  ttl: 3600, // 1 giờ
+});
+
+async function getUser(userId) {
+  // Cache library tự động kiểm tra & query
+  return await cache.wrap(`user:${userId}`, async () => {
+    return await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  });
+}
+```
+
+**Ưu điểm:**
+
+- ✅ Code ứng dụng sạch hơn
+- ✅ Tách biệt cache logic
+
+**Nhược điểm:**
+
+- ❌ Phụ thuộc library/ORM hỗ trợ
+- ❌ Lần đầu vẫn chậm
+
+**Khi nào dùng:** Ứng dụng sử dụng ORM/framework hỗ trợ
+
+---
+
+### 3️⃣ **Write-Through Cache**
+
+**Mô tả:** Khi ghi dữ liệu, phải ghi vào **cả Cache AND Database** cùng lúc.
+
+**Luồng dữ liệu:**
+
+```
+Application
+  ↓
+Ghi vào Cache
+  ↓ (Đợi hoàn tất)
+Ghi vào Database
+  ↓ (Cả hai xong)
+Báo "Success" cho user
+```
+
+**Code Example:**
+
+```javascript
+async function updateUser(userId, userData) {
+  // Ghi vào cache
+  await redis.setex(`user:${userId}`, 3600, JSON.stringify(userData));
+
+  // Ghi vào database (phải đợi cả hai hoàn tất)
+  await db.query("UPDATE users SET ? WHERE id = ?", [userData, userId]);
+
+  return { success: true };
+}
+```
+
+**Ưu điểm:**
+
+- ✅ Cache luôn mới nhất, khớp với DB
+- ✅ Không bao giờ bị data mismatch
+- ✅ An toàn dữ liệu
+
+**Nhược điểm:**
+
+- ❌ Tốc độ ghi chậm (phải đợi cả 2)
+- ❌ Nếu cache fail, phải rollback
+
+**Khi nào dùng:** Ứng dụng cần tính nhất quán cao (Banking, Payment)
+
+---
+
+### 4️⃣ **Write-Around (Write-Behind)**
+
+**Mô tả:** Ghi dữ liệu trực tiếp vào DB, **bỏ qua cache**. Cache chỉ được cập nhật khi có ai đó đọc.
+
+**Luồng dữ liệu:**
+
+```
+Write Request
+  ↓
+Ghi trực tiếp DB (không update cache)
+  ↓
+Báo "Success" (nhanh)
+
+Read Request
+  ↓
+Cache miss → Query DB → Update cache
+```
+
+**Code Example:**
+
+```javascript
+async function updateUser(userId, userData) {
+  // Chỉ ghi vào DB, BỎ QUA cache
+  await db.query("UPDATE users SET ? WHERE id = ?", [userData, userId]);
+
+  // (Không ghi vào cache)
+  // Lần tới khi ai đó đọc, sẽ cache-aside tự động
+
+  return { success: true };
+}
+
+async function getUser(userId) {
+  // Cache-aside: nếu miss thì update
+  let user = await redis.get(`user:${userId}`);
+  if (!user) {
+    user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+    await redis.setex(`user:${userId}`, 3600, JSON.stringify(user));
+  }
+  return JSON.parse(user);
+}
+```
+
+**Ưu điểm:**
+
+- ✅ Ghi rất nhanh (không đợi cache)
+- ✅ Tránh cache bị đầy bằng dữ liệu ít dùng
+- ✅ Giảm tải cache
+
+**Nhược điểm:**
+
+- ❌ Một thời gian Cache sẽ outdated
+- ❌ Lần đầu đọc sẽ miss
+
+**Khi nào dùng:** Ứng dụng có lượt ghi lớn, ít đọc
+
+---
+
+### 5️⃣ **Write-Back (Write-Behind)** ⚠️ Rủi ro cao
+
+**Mô tả:** Ghi vào cache rồi **báo "xong" ngay**. Sau đó, cache tự động batch ghi vào DB theo định kỳ.
+
+**Luồng dữ liệu:**
+
+```
+Write Request
+  ↓
+Ghi vào cache + Báo "xong" (cực nhanh)
+  ↓ (Background - định kỳ)
+Cache gom dữ liệu → Batch ghi DB
+```
+
+**Code Example:**
+
+```javascript
+// Cấu hình cache batch write
+const batchWriteInterval = 5000; // Mỗi 5 giây
+const writeBuffer = [];
+
+async function updateUser(userId, userData) {
+  // Chỉ ghi vào cache, báo xong ngay
+  await redis.set(`user:${userId}`, JSON.stringify(userData));
+
+  // Thêm vào batch queue
+  writeBuffer.push({ userId, userData });
+
+  return { success: true }; // ← Báo xong ngay (NHANH!)
+}
+
+// Background worker: Batch write to DB
+setInterval(async () => {
+  if (writeBuffer.length === 0) return;
+
+  const batch = writeBuffer.splice(0); // Lấy tất cả
+
+  try {
+    await db.query("INSERT INTO user_updates VALUES ?", [batch]);
+    console.log(`✅ Batch wrote ${batch.length} updates`);
+  } catch (err) {
+    console.error("❌ Batch write failed!", err);
+    // ⚠️ Dữ liệu có thể bị mất nếu cache sập!
+  }
+}, batchWriteInterval);
+```
+
+**Ưu điểm:**
+
+- ✅ Tốc độ ghi cực nhanh (write immediately to cache)
+- ✅ Chịu được tải ghi lớn
+- ✅ Giảm I/O database
+
+**Nhược điểm:**
+
+- ❌ ⚠️ **RẤT RỦI RO** - Nếu cache sập trước khi batch ghi DB, dữ liệu **MẤT VĩNH VIỄN**
+- ❌ Khó debug issues
+- ❌ Yêu cầu monitoring chặt chẽ
+
+**Khi nào dùng:** Analytics, logs (dữ liệu không critical), hoặc cache có backup
+
+---
+
+### 6️⃣ **Refresh-Ahead**
+
+**Mô tả:** Cache tự động dự đoán và **làm mới dữ liệu sắp hết hạn** trước khi user yêu cầu.
+
+**Luồng dữ liệu:**
+
+```
+Dữ liệu trong cache
+  ↓ (Sắp hết hạn? TTL < 30%)
+Cache tự động query DB + Update
+  ↓
+User yêu cầu
+  ↓
+Dữ liệu mới nhất + Nhanh ✅
+```
+
+**Code Example:**
+
+```javascript
+const REFRESH_THRESHOLD = 0.3; // Refresh khi còn 30% TTL
+
+async function refreshAhead(key, ttl, queryFn) {
+  const value = await redis.get(key);
+  const remaining = await redis.ttl(key);
+
+  // Nếu còn < 30% TTL, refresh trước
+  if (remaining > 0 && remaining / ttl < REFRESH_THRESHOLD) {
+    console.log(`🔄 Refreshing ${key} (TTL: ${remaining}s)`);
+
+    const newValue = await queryFn();
+    await redis.setex(key, ttl, JSON.stringify(newValue));
+  }
+
+  return JSON.parse(value);
+}
+
+// Sử dụng
+async function getProduct(productId) {
+  return await refreshAhead(
+    `product:${productId}`,
+    3600, // TTL 1 giờ
+    async () => {
+      console.log("📍 Query database for fresh product data");
+      return await db.query("SELECT * FROM products WHERE id = ?", [productId]);
+    },
+  );
+}
+```
+
+**Ưu điểm:**
+
+- ✅ User luôn có dữ liệu mới + nhanh
+- ✅ Không bao giờ cache miss
+- ✅ Giảm độ trễ
+
+**Nhược điểm:**
+
+- ❌ Phức tạp implement
+- ❌ Tiêu tốn tài nguyên refresh không cần thiết
+- ❌ Khó dự đoán pattern user
+
+**Khi nào dùng:** Dữ liệu hot (được truy cập nhiều), dashboard real-time
+
+---
+
+## 9. 📊 So Sánh 6 Chiến Lược Cache
+
+| Chiến lược        | Tốc độ Đọc | Tốc độ Ghi | Nhất quán   | Rủi ro   | Complexity |
+| ----------------- | ---------- | ---------- | ----------- | -------- | ---------- |
+| **Cache-Aside**   | ⭐⭐⭐     | ⭐⭐⭐⭐⭐ | ⚠️ Thấp     | 🟢 Thấp  | 🟢 Dễ      |
+| **Read-Through**  | ⭐⭐⭐     | ⭐⭐⭐⭐⭐ | ⚠️ Thấp     | 🟢 Thấp  | 🟡 Trung   |
+| **Write-Through** | ⭐⭐⭐⭐   | ⭐⭐       | 🟢 Cao      | 🟢 Thấp  | 🟡 Trung   |
+| **Write-Around**  | ⭐⭐       | ⭐⭐⭐⭐⭐ | ⚠️ Thấp     | 🟢 Thấp  | 🟢 Dễ      |
+| **Write-Back**    | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 🔴 Rất thấp | 🔴 CAO   | 🔴 Khó     |
+| **Refresh-Ahead** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐     | 🟡 Trung    | 🟡 Trung | 🔴 Khó     |
+
+---
+
+## 10. 🎯 Hướng Dẫn Chọn Chiến Lược
+
+```
+Có cần dữ liệu luôn mới nhất?
+  ├─ YES → Write-Through (safe nhất)
+  └─ NO ↓
+
+Có lượt ghi rất lớn (>10k/s)?
+  ├─ YES → Write-Back (nhanh nhất) ⚠️ nhưng rủi ro
+  │        hoặc Write-Around (an toàn hơn)
+  └─ NO ↓
+
+Dữ liệu thường xuyên truy cập?
+  ├─ YES → Refresh-Ahead (best UX)
+  └─ NO → Cache-Aside (default, phổ biến nhất)
+```
+
+**Khuyến nghị theo loại ứng dụng:**
+
+| Loại ứng dụng                 | Chiến lược                  |
+| ----------------------------- | --------------------------- |
+| **Web App, Blog, E-commerce** | Cache-Aside                 |
+| **Real-time Dashboard**       | Refresh-Ahead               |
+| **Payment, Banking**          | Write-Through               |
+| **High-traffic Analytics**    | Write-Back + Backup cache   |
+| **Social Media Feed**         | Cache-Aside + Refresh-Ahead |
+| **Search Engine**             | Read-Through + Write-Around |
+
+---
+
+## 11. 💡 Best Practice: Hybrid Strategy
+
+**Thực tế, ứng dụng lớn thường kết hợp 2-3 chiến lược:**
+
+```javascript
+// Hybrid: Cache-Aside + Refresh-Ahead + Write-Through
+class HybridCacheManager {
+  async getUser(userId) {
+    // 1. Cache-Aside: Kiểm tra cache
+    let user = await redis.get(`user:${userId}`);
+
+    if (!user) {
+      // 2. Cache Miss - Query database
+      user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+      await redis.setex(`user:${userId}`, 3600, JSON.stringify(user));
+    } else {
+      // 3. Refresh-Ahead: Nếu sắp hết hạn, update background
+      const ttl = await redis.ttl(`user:${userId}`);
+      if (ttl < 300) {
+        // Còn < 5 phút
+        this.refreshUserInBackground(userId);
+      }
+    }
+
+    return JSON.parse(user);
+  }
+
+  async updateUser(userId, data) {
+    // Write-Through: Ghi cả 2 cùng lúc
+    await redis.set(`user:${userId}`, JSON.stringify(data));
+    await db.query("UPDATE users SET ? WHERE id = ?", [data, userId]);
+  }
+
+  async refreshUserInBackground(userId) {
+    const user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+    await redis.setex(`user:${userId}`, 3600, JSON.stringify(user));
+  }
+}
+```
+
+**Kết quả:**
+
+- ✅ Đọc nhanh (Cache-Aside)
+- ✅ Luôn có data fresh (Refresh-Ahead)
+- ✅ Data nhất quán (Write-Through)
